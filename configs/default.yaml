@@ -1,0 +1,35 @@
+tasks: [rain, fog, snow, low_light]
+model:
+  widths: [32, 64, 128, 256]
+  encoder_blocks: [3, 3, 5, 8]
+  decoder_blocks: [3, 2, 5, 0]
+  encoder_sites: [[2, 3], [2, 3], [2, 3, 4, 5], [1, 2, 3, 4, 5, 6, 7, 8]]
+  decoder_sites: [[2, 3], [2], [3, 4, 5], []]
+  rank_base: 8
+  router_hidden: 1664
+training:
+  steps: 60000
+  validation_interval: 2000
+  batch_size: 8
+  replay_batch_size: 8
+  crop_size: 256
+  replay_size: 128
+  lr: 0.0002
+  min_lr: 0.000002
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  amp: true
+  fisher_samples: 128
+  fisher_decay: 1.0
+  ewc_weight: 100.0
+memory:
+  pairs_per_task: 32
+  total_pairs: null
+  candidates_per_image: 1
+loss:
+  ssim: 0.2
+  replay: 1.0
+  distillation: 0.5
+  feature: 0.05
+  route: 0.1
+  orthogonality: 0.01
