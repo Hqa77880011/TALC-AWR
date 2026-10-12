@@ -1,10 +1,20 @@
+import json
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from .data import pair
-from .io import load_checkpoint, read_manifest, rgb_tensor, save_rgb, write_csv, write_json
+from .io import (
+    load_checkpoint,
+    load_prediction,
+    read_manifest,
+    read_manifests,
+    save_prediction,
+    write_csv,
+    write_json,
+)
+from .memory import memory_bytes
 from .metrics import RestorationMetrics, auroc, continual_metrics, entropy, router_metrics
 from .model import build_model
 
@@ -33,41 +43,75 @@ def policy_arguments(policy, record, tasks):
 
 def summarize_rows(rows):
     tasks = sorted({r["task"] for r in rows})
-    measures = [
-        key
-        for key in rows[0]
-        if key
-        in {
-            "psnr",
-            "ssim",
-            "lpips",
-            "input_psnr",
-            "input_ssim",
-            "input_lpips",
-            "delta_psnr",
-            "delta_ssim",
-            "delta_lpips",
-            "top2_both_recalled",
+    measures = sorted(
+        {
+            key
+            for row in rows
+            for key in row
+            if key
+            in {
+                "psnr",
+                "ssim",
+                "lpips",
+                "input_psnr",
+                "input_ssim",
+                "input_lpips",
+                "delta_psnr",
+                "delta_ssim",
+                "delta_lpips",
+                "top2_both_recalled",
+            }
         }
-    ]
+    )
     grouped = {
         task: {
-            measure: float(np.mean([r[measure] for r in rows if r["task"] == task]))
+            measure: float(
+                np.mean([r[measure] for r in rows if r["task"] == task and measure in r])
+            )
             for measure in measures
+            if any(r["task"] == task and measure in r for r in rows)
         }
         for task in tasks
     }
     return {
         "per_task": grouped,
         "macro_task_mean": {
-            key: float(np.mean([grouped[t][key] for t in tasks])) for key in measures
+            key: float(np.mean([grouped[t][key] for t in tasks if key in grouped[t]]))
+            for key in measures
         },
+    }
+
+
+def checkpoint_identity(checkpoint):
+    return {
+        "variant": checkpoint["variant"],
+        "seed": checkpoint["seed"],
+        "stage": checkpoint["stage"],
+        "tasks": checkpoint["config"]["tasks"][: checkpoint["stage"]],
+        "paired_memory_mib": memory_bytes(checkpoint["memory"]) / 2**20,
+    }
+
+
+def final_router_summary(rows, checkpoint):
+    if not checkpoint["variant"].startswith("talc"):
+        return {}
+    tasks = checkpoint["config"]["tasks"][: checkpoint["stage"]]
+    if checkpoint["variant"] == "talc_uniform":
+        return {"routing_policy": "uniform_all_experts", "router_chance_accuracy": 1 / len(tasks)}
+    selected = [row for row in rows if row["task"] in tasks]
+    if not selected:
+        return {}
+    return {
+        "router": router_metrics(
+            [[row[f"p_{task}"] for task in tasks] for row in selected],
+            [tasks.index(row["task"]) for row in selected],
+        )
     }
 
 
 @torch.inference_mode()
 def score_records(model, checkpoint, records, metrics, device, policy="top2", save_directory=None):
-    rows, probabilities, labels = [], [], []
+    rows = []
     tasks = checkpoint["config"]["tasks"][: checkpoint["stage"]]
     for record in records:
         image, target = pair(record)
@@ -76,29 +120,30 @@ def score_records(model, checkpoint, records, metrics, device, policy="top2", sa
         image, target = image.unsqueeze(0).to(device), target.unsqueeze(0).to(device)
         top_k, forced = policy_arguments(policy, record, tasks)
         result = model(image, top_k=top_k, forced=forced)
-        row = {"id": record["id"], "task": record["task"]}
+        row = {
+            "id": record["id"],
+            "task": record["task"],
+            "scene": record.get("scene", record["id"]),
+            "degradation": json.dumps(record.get("degradations", []), sort_keys=True),
+        }
         restored = metrics(result["image"], target)
         degraded = metrics(image, target)
         row.update(restored)
         row.update({f"input_{key}": value for key, value in degraded.items()})
         row.update({f"delta_{key}": value - degraded[key] for key, value in restored.items()})
         p = result["probabilities"]
-        if p is not None:
+        if p is not None and model.router is not None:
             p = p[0].cpu().numpy()
             row.update({f"p_{task}": float(value) for task, value in zip(tasks, p)})
             row["entropy"] = float(entropy(p[None])[0]) if len(p) > 1 else 0.0
-            if record["task"] in tasks:
-                probabilities.append(p)
-                labels.append(tasks.index(record["task"]))
             if record.get("components"):
                 true_ids = {tasks.index(component) for component in record["components"]}
                 row["top2_both_recalled"] = int(true_ids.issubset(set(np.argsort(p)[-2:])))
         rows.append(row)
         if save_directory is not None:
-            save_rgb(Path(save_directory) / f"{record['id']}.png", result["image"][0])
+            save_prediction(save_directory, record["id"], result["image"][0])
     summary = summarize_rows(rows)
-    if probabilities:
-        summary["router"] = router_metrics(probabilities, labels)
+    summary.update(final_router_summary(rows, checkpoint))
     return rows, summary
 
 
@@ -107,9 +152,7 @@ def evaluate(args):
     output.mkdir(parents=True, exist_ok=True)
     model, checkpoint = loaded_model(args.checkpoint, args.device)
     metrics = RestorationMetrics(args.device, lpips_enabled=not args.no_lpips)
-    records = [r for path in args.manifests for r in read_manifest(path)]
-    if len({r["id"] for r in records}) != len(records):
-        raise ValueError("Evaluation manifests contain duplicate image IDs")
+    records = read_manifests(args.manifests)
     policy = args.policy or ("top1" if checkpoint["variant"] == "talc_top1" else "top2")
     rows, summary = score_records(
         model,
@@ -125,9 +168,7 @@ def evaluate(args):
         output / "summary.json",
         {
             "checkpoint": str(args.checkpoint),
-            "variant": checkpoint["variant"],
-            "seed": checkpoint["seed"],
-            "stage": checkpoint["stage"],
+            **checkpoint_identity(checkpoint),
             "policy": policy,
             **summary,
         },
@@ -156,6 +197,7 @@ def evaluate_matrix(args):
             {
                 "variant": "joint",
                 "seed": final["seed"],
+                "tasks": tasks,
                 "experiment": args.name or "joint",
                 "metrics": {"AP": summary["macro_task_mean"]["psnr"]},
                 **summary,
@@ -168,6 +210,15 @@ def evaluate_matrix(args):
     final_rows = []
     for stage, path in enumerate(paths, start=1):
         model, checkpoint = loaded_model(path, args.device)
+        if (
+            checkpoint["variant"] != final["variant"]
+            or checkpoint["seed"] != final["seed"]
+            or checkpoint["config"] != final["config"]
+            or checkpoint["stage"] != stage
+        ):
+            raise ValueError(
+                "Stage checkpoints must belong to the same method, seed and configuration"
+            )
         rows = []
         for task_index, task in enumerate(tasks[:stage]):
             if final["variant"] == "separate":
@@ -182,17 +233,20 @@ def evaluate_matrix(args):
             )
             matrix[stage - 1, task_index] = summary["macro_task_mean"]["psnr"]
             rows.extend(task_rows)
-        write_csv(output / f"stage{stage}_per_image.csv", rows)
+        write_csv(
+            output / ("per_image.csv" if stage == len(tasks) else f"stage{stage}_per_image.csv"),
+            rows,
+        )
         if stage == len(tasks):
             final_rows = rows
     serial_matrix = [[float(v) if np.isfinite(v) else None for v in row] for row in matrix]
     write_json(output / "matrix.json", {"tasks": tasks, "psnr": serial_matrix})
     summary = summarize_rows(final_rows)
+    summary.update(final_router_summary(final_rows, final))
     write_json(
         output / "summary.json",
         {
-            "variant": final["variant"],
-            "seed": final["seed"],
+            **checkpoint_identity(final),
             "experiment": args.name or final["variant"],
             "metrics": continual_metrics(matrix),
             **summary,
@@ -212,14 +266,21 @@ def diagnostics(args):
     known = [r for task in tasks for r in read_manifest(Path(args.data) / f"test_{task}.jsonl")]
     known_rows, known_summary = score_records(model, checkpoint, known, metrics, args.device)
     write_csv(output / "known_per_image.csv", known_rows)
-    report = {"single_weather": known_summary["router"], "mixtures": {}}
+    report = {
+        **checkpoint_identity(checkpoint),
+        "single_weather": known_summary["router"],
+        "mixtures": {},
+    }
     for mixture in ["mixed", "mixed_shift"]:
         records = read_manifest(Path(args.data) / f"test_{mixture}.jsonl")
         report["mixtures"][mixture] = {}
         for policy in ["top1", "top2", "true_pair", "wrong_pair"]:
             rows, summary = score_records(model, checkpoint, records, metrics, args.device, policy)
             write_csv(output / f"{mixture}_{policy}_per_image.csv", rows)
-            report["mixtures"][mixture][policy] = summary["macro_task_mean"]
+            report["mixtures"][mixture][policy] = {
+                **summary["macro_task_mean"],
+                "per_task": summary["per_task"],
+            }
         reference = report["mixtures"][mixture]["true_pair"]["psnr"]
         for item in report["mixtures"][mixture].values():
             item["true_pair_psnr_gap"] = reference - item["psnr"]
@@ -276,19 +337,20 @@ def infer(args):
     for record in records:
         image, _ = pair(record)
         result = model(image.unsqueeze(0).to(args.device), top_k=1 if policy == "top1" else 2)
-        save_rgb(output / f"{record['id']}.png", result["image"][0])
+        save_prediction(output, record["id"], result["image"][0], args.format)
 
 
 @torch.inference_mode()
 def score_predictions(args):
-    records = read_manifest(args.manifest)
+    manifests = args.manifests or [args.manifest]
+    records = read_manifests(manifests)
     metrics = RestorationMetrics(args.device, lpips_enabled=not args.no_lpips)
     rows = []
     for record in records:
         image, target = pair(record)
         if target is None:
             raise ValueError("Prediction scoring requires paired targets")
-        prediction = rgb_tensor(Path(args.predictions) / f"{record['id']}.png")
+        prediction = load_prediction(args.predictions, record["id"])
         if prediction.shape != target.shape:
             raise ValueError(f"Prediction dimensions differ from target: {record['id']}")
         target = target.unsqueeze(0).to(args.device)
@@ -298,10 +360,15 @@ def score_predictions(args):
             {
                 "id": record["id"],
                 "task": record["task"],
+                "scene": record.get("scene", record["id"]),
+                "degradation": json.dumps(record.get("degradations", []), sort_keys=True),
                 **restored,
                 **{f"input_{k}": v for k, v in degraded.items()},
                 **{f"delta_{k}": v - degraded[k] for k, v in restored.items()},
             }
         )
     write_csv(Path(args.output) / "per_image.csv", rows)
-    write_json(Path(args.output) / "summary.json", {"method": args.name, **summarize_rows(rows)})
+    write_json(
+        Path(args.output) / "summary.json",
+        {"method": args.name, "seed": args.seed, "manifests": manifests, **summarize_rows(rows)},
+    )

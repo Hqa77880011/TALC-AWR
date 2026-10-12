@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from .data import pair
-from .io import read_json, read_manifest, rgb_tensor, write_csv, write_json
+from .io import load_prediction, read_json, read_manifest, write_csv, write_json
 
 COLORS = ["#4779a8", "#51999e", "#6d986b", "#777c84", "#a08d71", "#807fa6"]
 
@@ -178,7 +178,7 @@ def qualitative(args):
         image, target = pair(record)
         panels = [("Input", image)]
         panels.extend(
-            (name, rgb_tensor(Path(folder) / f"{record['id']}.png"))
+            (name, load_prediction(folder, record["id"]))
             for name, folder in zip(names, args.predictions)
         )
         if target is not None:
@@ -191,3 +191,67 @@ def qualitative(args):
             ax.set_title(name)
             ax.axis("off")
         save_figure(figure, output / record["id"])
+
+
+def plot_comparison(args):
+    record = read_json(args.comparison)
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    defaults = {
+        "restoration": ["quality.psnr", "continual.F", "quality.lpips"],
+        "segmentation": ["restored.macro_condition_miou", "delta_macro_miou_pp"],
+        "detection": [
+            "macro_condition_mean.restored.AP_50_95",
+            "macro_condition_mean.restored.AP_small",
+        ],
+        "routing": [
+            "single_weather.macro_accuracy",
+            "mixtures.mixed.top2.psnr",
+            "blur.entropy_auroc",
+        ],
+        "profile": ["parameters", "active_conv_linear_gflops", "fps"],
+    }
+    metrics = args.metrics or defaults[record["kind"]]
+    supported = [
+        key for key in metrics if any(key in values for values in record["groups"].values())
+    ]
+    if not supported:
+        raise ValueError("The comparison has no requested metrics")
+    figure, axes = plt.subplots(1, len(supported), figsize=(5 * len(supported), 4.5), squeeze=False)
+    for ax, key in zip(axes[0], supported):
+        methods = [method for method, values in record["groups"].items() if key in values]
+        values = [record["groups"][method][key] for method in methods]
+        ax.bar(
+            range(len(methods)),
+            [v["mean"] for v in values],
+            yerr=[v["sample_sd"] or 0 for v in values],
+            capsize=3,
+            color=COLORS[0],
+        )
+        ax.set_xticks(range(len(methods)), methods, rotation=40, ha="right")
+        ax.set_ylabel(key)
+    save_figure(figure, output / f"{record['kind']}_comparison")
+    if args.restoration_comparison:
+        quality = read_json(args.restoration_comparison)
+        if record["kind"] != "profile" or quality["kind"] != "restoration":
+            raise ValueError("Tradeoff plots require profile and restoration comparisons")
+        names = [
+            name
+            for name in record["groups"]
+            if name in quality["groups"] and "continual.F" in quality["groups"][name]
+        ]
+        if not names:
+            raise ValueError("Tradeoff files have no matching experiment names")
+        figure, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+        for index, name in enumerate(names):
+            cost, scores = record["groups"][name], quality["groups"][name]
+            points = [
+                (cost["parameters"]["mean"] / 1e6, scores["continual.F"]["mean"]),
+                (cost["fps"]["mean"], scores["quality.psnr"]["mean"]),
+            ]
+            for ax, (x, y) in zip(axes, points):
+                ax.scatter(x, y, color=COLORS[index % len(COLORS)])
+                ax.annotate(name, (x, y), xytext=(3, 3), textcoords="offset points", fontsize=8)
+        axes[0].set(xlabel="Stored parameters (M)", ylabel="Forgetting (dB)")
+        axes[1].set(xlabel="FPS", ylabel="Mean PSNR (dB)")
+        save_figure(figure, output / "efficiency_tradeoff")

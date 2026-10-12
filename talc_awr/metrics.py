@@ -17,7 +17,10 @@ def ssim(prediction, target):
 
     def smooth(x):
         with torch.autocast(device_type=x.device.type, enabled=False):
-            return F.conv2d(x.float(), window, groups=x.shape[1])
+            padding = size // 2
+            mode = "reflect" if min(x.shape[-2:]) > padding else "replicate"
+            padded = F.pad(x.float(), (padding, padding, padding, padding), mode=mode)
+            return F.conv2d(padded, window, groups=x.shape[1])
 
     mu_x, mu_y = smooth(prediction), smooth(target)
     var_x = (smooth(prediction.square()) - mu_x.square()).clamp_min(0)
@@ -42,14 +45,14 @@ class RestorationMetrics:
         if lpips_enabled:
             import lpips
 
-            self.lpips = lpips.LPIPS(net="alex").eval().to(device)
+            self.lpips = lpips.LPIPS(net="alex", version="0.1", spatial=False).eval().to(device)
             self.lpips.requires_grad_(False)
 
     @torch.inference_mode()
     def __call__(self, prediction, target):
         result = {"psnr": psnr(prediction, target).item(), "ssim": ssim(prediction, target).item()}
         if self.lpips is not None:
-            result["lpips"] = self.lpips(2 * prediction - 1, 2 * target - 1).item()
+            result["lpips"] = self.lpips(2 * prediction - 1, 2 * target - 1, normalize=False).item()
         return result
 
 

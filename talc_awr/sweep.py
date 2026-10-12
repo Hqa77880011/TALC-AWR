@@ -7,6 +7,10 @@ from .data import WEATHERS
 
 
 def sweep(args):
+    if args.suite == "orders" and not args.order_replay_plans:
+        raise ValueError(
+            "Order sensitivity requires --order-replay-plans for all three first-task references"
+        )
     experiments = []
     if args.suite == "main":
         experiments = [
@@ -89,8 +93,13 @@ def sweep(args):
                 "--output",
                 str(output),
             ]
-            if args.replay_plan:
-                command.extend(["--replay-plan", args.replay_plan])
+            replay_plan = (
+                args.order_replay_plans[int(label[-1]) - 1]
+                if args.suite == "orders"
+                else args.replay_plan
+            )
+            if replay_plan:
+                command.extend(["--replay-plan", replay_plan])
             for key, value in options.items():
                 command.extend([key, str(value)])
             if tasks:

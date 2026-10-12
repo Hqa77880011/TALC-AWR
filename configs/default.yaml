@@ -25,7 +25,7 @@ training:
 memory:
   pairs_per_task: 32
   total_pairs: null
-  candidates_per_image: 1
+  candidates_per_image: 4
 loss:
   ssim: 0.2
   replay: 1.0

@@ -7,7 +7,7 @@ name = "talc-awr"
 version = "0.1.0"
 description = "Task-Aware Lightweight Continual Learning for All-in-One Adverse Weather Image Restoration"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = "MIT"
 dependencies = [
   "torch==2.7.1",

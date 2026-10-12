@@ -5,7 +5,15 @@ import torch
 from PIL import Image, ImageDraw
 from scipy import ndimage, signal
 
-from .io import read_json, read_manifest, rgb_tensor, save_rgb, write_json, write_manifest
+from .io import (
+    read_json,
+    read_manifest,
+    read_manifests,
+    rgb_tensor,
+    save_rgb,
+    write_json,
+    write_manifest,
+)
 
 WEATHERS = ["rain", "fog", "snow", "low_light"]
 TRAIN_IDS = [7, 8, 11, 12, 13, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 31, 32, 33]
@@ -50,7 +58,7 @@ def weather_parameters(weather, rng, high=False):
         return {
             "weather": weather,
             "particles": 1400 if high else int(rng.choice([400, 800, 1200])),
-            "radius": int(rng.choice([1, 2, 3])),
+            "radius": 3 if high else int(rng.choice([1, 2, 3])),
             "opacity": 0.75 if high else float(rng.choice([0.3, 0.5, 0.7])),
         }
     if weather == "low_light":
@@ -59,39 +67,46 @@ def weather_parameters(weather, rng, high=False):
             "exposure": 0.35 if high else float(rng.choice([0.4, 0.55, 0.7])),
             "gamma": 2.8 if high else float(rng.choice([1.8, 2.2, 2.6])),
             "sigma": 0.018 if high else float(rng.choice([0.005, 0.01, 0.015])),
+            "poisson_peak": 256.0,
         }
     raise ValueError(f"Unknown weather: {weather}")
 
 
-def streaks(height, width, length, angle, rng):
-    size = 2 * length + 1
-    kernel = Image.new("F", (size, size), 0)
-    draw = ImageDraw.Draw(kernel)
-    radians = np.deg2rad(angle)
-    dx, dy = np.sin(radians) * length / 2, np.cos(radians) * length / 2
-    draw.line((length - dx, length - dy, length + dx, length + dy), fill=1, width=1)
-    kernel = np.asarray(kernel, dtype=np.float32).copy()
-    kernel /= max(kernel.max(), 1)
+def streaks(height, width, length, angle, seeds):
     layer = np.zeros((height, width), dtype=np.float32)
-    for scale, density in [(1, 0.0016), (2, 0.0012), (4, 0.0008)]:
-        h, w = max(1, height // scale), max(1, width // scale)
-        impulses = (rng.random((h, w)) < density).astype(np.float32)
-        band = signal.fftconvolve(impulses, kernel, mode="same")
-        band = np.asarray(
-            Image.fromarray(band.astype(np.float32)).resize(
-                (width, height), Image.Resampling.BILINEAR
-            )
+    settings = [(0.5, 1, 600, 0.3), (1.0, 2, 300, 0.6), (2.0, 3, 100, 1.0)]
+    for seed, (multiplier, thickness, count, sigma) in zip(seeds, settings):
+        rng = np.random.default_rng(seed)
+        band_length = max(1, int(np.floor(length * multiplier + 0.5)))
+        count = int(np.floor(count * height * width / (2048 * 1024) + 0.5))
+        size = 2 * band_length + 1
+        kernel = Image.new("F", (size, size), 0)
+        draw = ImageDraw.Draw(kernel)
+        radians = np.deg2rad(angle)
+        dx, dy = np.sin(radians) * band_length / 2, np.cos(radians) * band_length / 2
+        draw.line(
+            (band_length - dx, band_length - dy, band_length + dx, band_length + dy),
+            fill=1,
+            width=thickness,
         )
-        layer += band / scale
+        kernel = np.asarray(kernel, dtype=np.float32).copy()
+        impulses = np.zeros((height, width), dtype=np.float32)
+        y, x = rng.integers(height, size=count), rng.integers(width, size=count)
+        np.add.at(impulses, (y, x), rng.uniform(0.6, 1.0, size=count))
+        band = signal.fftconvolve(impulses, kernel, mode="same")
+        layer += ndimage.gaussian_filter(
+            band, sigma=sigma, mode="reflect", radius=int(np.ceil(3 * sigma))
+        )
     return np.clip(layer, 0, 1)
 
 
-def degrade(image, parameters, rng, depth=None):
+def degrade(image, parameters, depth=None):
     h, w = image.shape[:2]
     weather = parameters["weather"]
+    seeds = parameters["component_seeds"]
     if weather == "rain":
         alpha = parameters["opacity"] * streaks(
-            h, w, parameters["length"], parameters["angle"], rng
+            h, w, parameters["length"], parameters["angle"], seeds[1:4]
         )
         result = image * (1 - alpha[..., None]) + alpha[..., None]
     elif weather == "fog":
@@ -100,24 +115,45 @@ def degrade(image, parameters, rng, depth=None):
         transmission = np.exp(-parameters["beta"] * depth)[..., None]
         result = image * transmission + parameters["airlight"] * (1 - transmission)
     elif weather == "snow":
-        layer = Image.new("F", (w, h), 0)
-        draw = ImageDraw.Draw(layer)
+        disks, streak_layer = np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.float32)
         radius = parameters["radius"]
-        for x, y in zip(
-            rng.integers(w, size=parameters["particles"]),
-            rng.integers(h, size=parameters["particles"]),
-        ):
-            draw.ellipse(
-                (int(x) - radius, int(y) - radius, int(x) + radius, int(y) + radius), fill=1
+        disk_count = int(np.floor(0.9 * parameters["particles"] + 0.5))
+        for layer, count, seed, disk in [
+            (disks, disk_count, seeds[1], True),
+            (streak_layer, parameters["particles"] - disk_count, seeds[2], False),
+        ]:
+            rng = np.random.default_rng(seed)
+            positions = zip(
+                rng.integers(w, size=count),
+                rng.integers(h, size=count),
+                rng.uniform(0.6, 1.0, size=count),
             )
-        mask = ndimage.gaussian_filter(np.asarray(layer), sigma=max(0.5, radius / 2))
-        mask += 0.2 * streaks(h, w, 12, 0, rng)
+            for x, y, brightness in positions:
+                if disk:
+                    x0, x1 = max(0, int(x) - radius), min(w, int(x) + radius + 1)
+                    y0, y1 = max(0, int(y) - radius), min(h, int(y) + radius + 1)
+                    yy, xx = np.ogrid[y0:y1, x0:x1]
+                    mask = (xx - x) ** 2 + (yy - y) ** 2 <= radius**2
+                    layer[y0:y1, x0:x1] += mask * brightness
+                else:
+                    layer[
+                        max(0, int(y) - 4) : min(h, int(y) + 5),
+                        max(0, int(x) - radius) : min(w, int(x) + radius + 1),
+                    ] += brightness
+        mask = ndimage.gaussian_filter(disks, sigma=0.8, mode="reflect", radius=3)
+        mask += streak_layer
         alpha = np.clip(mask, 0, 1) * parameters["opacity"]
         result = image * (1 - alpha[..., None]) + alpha[..., None]
     elif weather == "low_light":
         signal_level = (image * parameters["exposure"]) ** parameters["gamma"]
-        result = rng.poisson(signal_level * 255).astype(np.float32) / 255
-        result += rng.normal(0, parameters["sigma"], image.shape).astype(np.float32)
+        poisson_peak = float(parameters.get("poisson_peak", 256.0))
+        photon_counts = np.random.default_rng(seeds[1]).poisson(signal_level * poisson_peak)
+        result = photon_counts.astype(np.float32) / poisson_peak
+        result += (
+            np.random.default_rng(seeds[2])
+            .normal(0, parameters["sigma"], image.shape)
+            .astype(np.float32)
+        )
     elif weather == "blur":
         result = ndimage.gaussian_filter(image, sigma=(parameters["sigma"], parameters["sigma"], 0))
     else:
@@ -134,9 +170,8 @@ def pair(record):
             raise ValueError("Synthetic records require a clean target")
         array = target.permute(1, 2, 0).numpy()
         depth = np.load(record["depth"]) if record.get("depth") else None
-        rng = np.random.default_rng(record["seed"])
         for parameters in record["degradations"]:
-            array = degrade(array, parameters, rng, depth)
+            array = degrade(array, parameters, depth)
         image = torch.from_numpy(array.copy()).permute(2, 0, 1)
     if target is not None and image.shape != target.shape:
         raise ValueError(f"Unaligned pair: {record['id']}")
@@ -180,15 +215,11 @@ def depth_from_disparity(disparity_path, camera_path, semantic_path):
     disparity = (raw - 1) / 256
     valid = raw > 1
     depth = np.zeros_like(raw)
-    depth[valid] = np.clip(
-        camera["intrinsic"]["fx"] * camera["extrinsic"]["baseline"] / disparity[valid], 0.1, 200
-    )
-    if not valid.any():
-        raise ValueError(f"No valid disparity: {disparity_path}")
-    fallback = float(np.median(depth[valid]))
+    depth[valid] = camera["intrinsic"]["fx"] * camera["extrinsic"]["baseline"] / disparity[valid]
+    fallback = float(np.median(depth[valid])) if valid.any() else 80.0
     labels = np.asarray(Image.open(semantic_path))
     for semantic_id in np.unique(labels):
-        components, _ = ndimage.label(labels == semantic_id)
+        components, _ = ndimage.label(labels == semantic_id, structure=np.ones((3, 3)))
         boxes = ndimage.find_objects(components)
         for component, box in enumerate(boxes, start=1):
             if box is None:
@@ -198,7 +229,7 @@ def depth_from_disparity(disparity_path, camera_path, semantic_path):
             median = float(np.median(depth[box][observed])) if observed.any() else fallback
             region = depth[box]
             region[mask & ~valid[box]] = median
-    return depth.astype(np.float32)
+    return np.clip(depth, 1, 80).astype(np.float32)
 
 
 def stratified_split(paths, validation_size, rng):
@@ -224,8 +255,13 @@ def prepare_cityscapes(args):
     test = sorted((root / "leftImg8bit/val").glob("*/*_leftImg8bit.png"))
     if not train or not test:
         raise FileNotFoundError("Expected leftImg8bit/train and leftImg8bit/val below --root")
-    rng = np.random.default_rng(args.seed)
-    train, validation = stratified_split(train, args.validation_size, rng)
+    indices = {
+        path.name.removesuffix("_leftImg8bit.png"): index
+        for index, path in enumerate(sorted(train + test, key=lambda p: p.name))
+    }
+    train, validation = stratified_split(
+        train, args.validation_size, np.random.default_rng(args.seed)
+    )
     splits = {"train": train, "val": validation, "test": test}
     output.mkdir(parents=True, exist_ok=True)
     base_records = {}
@@ -248,6 +284,8 @@ def prepare_cityscapes(args):
             entries.append(
                 {
                     "id": stem,
+                    "scene": stem,
+                    "base_index": indices[stem],
                     "target": str(path),
                     "depth": str(depth_path),
                     "mask": str(semantic),
@@ -257,49 +295,71 @@ def prepare_cityscapes(args):
             )
         base_records[split] = entries
     tasks = WEATHERS + [f"{w}_high" for w in WEATHERS]
+    evaluation_settings = {}
     for split, bases in base_records.items():
-        for task in tasks:
+        for task_index, task in enumerate(tasks, start=1):
             records = []
             for base in bases:
                 for variant in range(args.variants if split == "train" else 1):
-                    seed = int(rng.integers(0, 2**63))
+                    split_index = {"train": 0, "val": 1, "test": 2}[split]
+                    seed = (
+                        args.degradation_root
+                        + 10**9 * split_index
+                        + 10**7 * task_index
+                        + 100 * base["base_index"]
+                        + 10 * variant
+                    )
                     weather = task.removesuffix("_high")
                     parameters = weather_parameters(
                         weather, np.random.default_rng(seed), task.endswith("_high")
                     )
+                    parameters["component_seeds"] = [seed + i for i in range(4)]
                     records.append(
                         {
                             **base,
                             "id": f"{base['id']}_{task}_{variant}",
                             "task": task,
+                            "task_id": task_index,
+                            "variant": variant,
                             "seed": seed,
                             "degradations": [parameters],
                         }
                     )
+                    if split == "test":
+                        evaluation_settings[(base["id"], task)] = parameters
             write_manifest(output / f"{split}_{task}.jsonl", records)
     for name, high in [("mixed", False), ("mixed_shift", True), ("blur", False)]:
         records = []
         for index, base in enumerate(base_records["test"]):
             components = ["rain", "fog"] if index < len(test) // 2 else ["snow", "low_light"]
-            seed = int(rng.integers(0, 2**63))
-            local_rng = np.random.default_rng(seed)
             parameters = (
-                [{"weather": "blur", "sigma": 1.5}]
+                [{"weather": "blur", "sigma": 1.5, "component_seeds": [0, 0, 0, 0]}]
                 if name == "blur"
-                else [weather_parameters(w, local_rng, high) for w in components]
+                else [
+                    evaluation_settings[(base["id"], w + ("_high" if high else ""))]
+                    for w in components
+                ]
             )
             records.append(
                 {
                     **base,
                     "id": f"{base['id']}_{name}",
-                    "task": name,
+                    "task": name if name == "blur" else "_".join(components),
+                    "mixture": name,
                     "components": [] if name == "blur" else components,
-                    "seed": seed,
                     "degradations": parameters,
                 }
             )
         write_manifest(output / f"test_{name}.jsonl", records)
     write_json(output / "splits.json", {s: [r["id"] for r in rs] for s, rs in base_records.items()})
+    write_json(
+        output / "preparation.json",
+        {
+            "split_seed": args.seed,
+            "degradation_root": args.degradation_root,
+            "variants": args.variants,
+        },
+    )
     print(
         f"Prepared {len(train)}/{len(validation)}/{len(test)} clean train/val/test scenes in {output}"
     )
@@ -331,7 +391,7 @@ def prepare_pairs(args):
         )
     records = [
         {
-            "id": key.replace("/", "__"),
+            "id": args.task + "__" + key.replace("/", "__"),
             "input": str(inputs[key]),
             "target": str(targets[key]),
             "task": args.task,
@@ -390,7 +450,7 @@ def semantic_labels(record):
 
 
 def prepare_detection(args):
-    records = read_manifest(args.manifest)
+    records = read_manifests(args.manifests or [args.manifest])
     instance_classes = [24, 25, 26, 27, 28, 31, 32, 33]
     categories = [
         {"id": i + 1, "name": CLASS_NAMES[TRAIN_IDS.index(c)]}
@@ -405,18 +465,25 @@ def prepare_detection(args):
             class_id = instance_id // 1000 if instance_id >= 1000 else instance_id
             if class_id not in instance_classes:
                 continue
-            y, x = np.nonzero(ids == instance_id)
-            x0, y0, x1, y1 = int(x.min()), int(y.min()), int(x.max()) + 1, int(y.max()) + 1
-            annotations.append(
-                {
-                    "id": len(annotations) + 1,
-                    "image_id": image_id,
-                    "category_id": instance_classes.index(class_id) + 1,
-                    "bbox": [x0, y0, x1 - x0, y1 - y0],
-                    "area": int(len(x)),
-                    "iscrowd": int(instance_id < 1000),
-                }
-            )
+            region = ids == instance_id
+            if instance_id < 1000:
+                components, count = ndimage.label(region, structure=np.ones((3, 3)))
+                regions = (components == index for index in range(1, count + 1))
+            else:
+                regions = [region]
+            for mask in regions:
+                y, x = np.nonzero(mask)
+                x0, y0, x1, y1 = int(x.min()), int(y.min()), int(x.max()) + 1, int(y.max()) + 1
+                annotations.append(
+                    {
+                        "id": len(annotations) + 1,
+                        "image_id": image_id,
+                        "category_id": instance_classes.index(class_id) + 1,
+                        "bbox": [x0, y0, x1 - x0, y1 - y0],
+                        "area": (x1 - x0) * (y1 - y0),
+                        "iscrowd": int(instance_id < 1000),
+                    }
+                )
     write_json(
         args.output,
         {"info": {}, "images": images, "annotations": annotations, "categories": categories},

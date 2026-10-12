@@ -8,9 +8,9 @@ import torch
 from torch.nn import functional as F
 
 from .data import batch, pair
-from .io import load_checkpoint, load_config, read_manifest, seed_everything, write_json
+from .io import load_checkpoint, load_config, read_json, read_manifest, seed_everything, write_json
 from .losses import distillation_loss, restoration_loss, routing_loss
-from .memory import memory_bytes, replay_batch, update_memory
+from .memory import allocations, memory_bytes, replay_batch, update_memory
 from .metrics import psnr
 from .model import build_model
 
@@ -82,7 +82,21 @@ def fisher_diagonal(model, records, config, rng, device):
     return fisher
 
 
-def save_stage(path, model, config, variant, stage, seed, memory, fisher, anchor, step, scores):
+def save_stage(
+    path,
+    model,
+    config,
+    variant,
+    stage,
+    seed,
+    memory,
+    fisher,
+    anchor,
+    step,
+    scores,
+    current_rng,
+    replay_rng,
+):
     checkpoint = {
         "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
         "config": config,
@@ -94,6 +108,12 @@ def save_stage(path, model, config, variant, stage, seed, memory, fisher, anchor
         "anchor": {k: v.cpu() for k, v in anchor.items()},
         "selected_step": step,
         "validation_psnr": scores,
+        "rng": {
+            "current": current_rng.bit_generator.state,
+            "replay": replay_rng.bit_generator.state,
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        },
     }
     torch.save(checkpoint, path)
 
@@ -126,6 +146,21 @@ def train(args):
     )
     if memory_enabled and not args.replay_plan:
         raise ValueError("Replay methods require --replay-plan from select-memory")
+    if memory_enabled:
+        plan = read_json(args.replay_plan)
+        if plan["task_order"] != config["tasks"]:
+            raise ValueError("Replay plan must use this run's task order and first-task reference")
+        for stage, task in enumerate(config["tasks"], start=1):
+            if len(plan["tasks"].get(task, [])) < allocations(config, stage)[-1]:
+                raise ValueError(f"Replay plan has insufficient ordered candidates for {task}")
+    if args.resume and variant == "joint":
+        raise ValueError(
+            "Joint training has one completed checkpoint and cannot resume a task stream"
+        )
+    if args.stage_limit is not None and variant == "joint":
+        raise ValueError(
+            "--stage-limit applies to sequential methods; joint training sees every task"
+        )
     seed_everything(args.seed)
     device = torch.device(args.device)
     output = Path(args.output)
@@ -133,6 +168,8 @@ def train(args):
     if any(output.glob("stage*.pt")):
         raise FileExistsError("Use a new output directory or resume into a new directory")
     model, memory, fisher, anchor = None, {}, {}, {}
+    current_rng = np.random.default_rng(90000 + args.seed)
+    replay_rng = np.random.default_rng(91000 + args.seed)
     start = 1
     if args.resume:
         previous = load_checkpoint(args.resume)
@@ -148,6 +185,11 @@ def train(args):
         memory = previous["memory"]
         fisher = {k: v.to(device) for k, v in previous["fisher"].items()}
         anchor = {k: v.to(device) for k, v in previous["anchor"].items()}
+        current_rng.bit_generator.state = previous["rng"]["current"]
+        replay_rng.bit_generator.state = previous["rng"]["replay"]
+        torch.set_rng_state(previous["rng"]["torch"])
+        if device.type == "cuda" and previous["rng"]["cuda"]:
+            torch.cuda.set_rng_state_all(previous["rng"]["cuda"])
     limit = min(args.stage_limit or len(config["tasks"]), len(config["tasks"]))
     if start > limit:
         raise ValueError("No remaining stage to train")
@@ -159,7 +201,6 @@ def train(args):
     top_k = 1 if variant == "talc_top1" else 2
     stages = [len(config["tasks"])] if variant == "joint" else range(start, limit + 1)
     for stage in stages:
-        seed_everything(args.seed + stage * 1009)
         task = config["tasks"][stage - 1]
         records = read_manifest(Path(args.data) / f"train_{task}.jsonl")
         if variant == "joint":
@@ -198,12 +239,6 @@ def train(args):
         best_path = output / f"stage{stage}.pt"
         with (output / f"stage{stage}_loss.jsonl").open("w", encoding="utf-8") as log:
             for step in range(1, steps + 1):
-                current_rng = np.random.default_rng(
-                    np.random.SeedSequence([args.seed, stage, step, 0])
-                )
-                replay_rng = np.random.default_rng(
-                    np.random.SeedSequence([args.seed, stage, step, 1])
-                )
                 image, target, labels = batch(
                     records,
                     training["batch_size"],
@@ -255,7 +290,12 @@ def train(args):
                                 distillation = distillation_loss(
                                     replay, old, loss_config["feature"]
                                 )
-                            loss = loss + loss_config["distillation"] * distillation
+                            distillation_weight = (
+                                0.5
+                                if variant in {"derpp", "derpp_capacity"}
+                                else loss_config["distillation"]
+                            )
+                            loss = loss + distillation_weight * distillation
                             terms["distillation"] = distillation.detach().float().item()
                     if variant == "lwf" and teacher is not None:
                         with torch.no_grad():
@@ -307,6 +347,8 @@ def train(args):
                             anchor,
                             step,
                             scores,
+                            current_rng,
+                            replay_rng,
                         )
         model.load_state_dict(load_checkpoint(best_path)["model"])
         if variant == "ewc":
@@ -332,6 +374,8 @@ def train(args):
             anchor,
             best_step,
             best_scores,
+            current_rng,
+            replay_rng,
         )
         write_json(
             output / f"stage{stage}_summary.json",

@@ -12,6 +12,7 @@ class ChannelNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(self, x):
+        x = x.float()
         mean = x.mean(1, keepdim=True)
         variance = (x - mean).square().mean(1, keepdim=True)
         return (x - mean) * torch.rsqrt(variance + 1e-6) * self.weight + self.bias
@@ -127,11 +128,11 @@ class Restorer(nn.Module):
         x = self.stem(x)
         for block in self.encoder[0]:
             x = block(x)
-        a = x.mean((2, 3))
+        a = x.mean((2, 3), dtype=torch.float32)
         x = self.down[0](x)
         for block in self.encoder[1]:
             x = block(x)
-        return torch.cat([a, x.mean((2, 3))], 1)
+        return torch.cat([a, x.mean((2, 3), dtype=torch.float32)], 1)
 
     def configure_trainable(self, unfreeze_old=False):
         for parameter in self.parameters():
@@ -208,7 +209,8 @@ class Restorer(nn.Module):
         top_k = self.default_top_k if top_k is None else top_k
         height, width = x.shape[-2:]
         pad_h, pad_w = (-height) % 8, (-width) % 8
-        x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+        mode = "reflect" if pad_h < height and pad_w < width else "replicate"
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode=mode)
         weights = probabilities = logits = None
         if self.kind == "talc":
             if not self.tasks:
@@ -232,7 +234,7 @@ class Restorer(nn.Module):
                 z, term = self._block(block, z, f"d{level}_{index}", weights, orth)
                 penalty = penalty + term
             features[level] = z
-        restored = (x + self.head(z)).clamp(0, 1)[..., :height, :width]
+        restored = (x.float() + self.head(z).float())[..., :height, :width].clamp(0, 1)
         return {
             "image": restored,
             "features": features,

@@ -1,11 +1,12 @@
 import argparse
 
+from .compare import compare
 from .data import export_data, prepare_acdc, prepare_cityscapes, prepare_detection, prepare_pairs
 from .evaluate import diagnostics, evaluate, evaluate_matrix, infer, score_predictions
 from .memory import select_memory
 from .perception import detection, segmentation, train_detector
 from .profile import profile
-from .report import plot_diagnostics, plot_perception, qualitative, report
+from .report import plot_comparison, plot_diagnostics, plot_perception, qualitative, report
 from .sweep import sweep
 from .train import VARIANTS, train
 
@@ -37,7 +38,8 @@ def main():
     )
     city.add_argument("--root", required=True)
     city.add_argument("--output", default="data/weather")
-    city.add_argument("--seed", type=int, default=17)
+    city.add_argument("--seed", type=int, default=2025, help="City-stratified split seed")
+    city.add_argument("--degradation-root", type=int, default=41001)
     city.add_argument("--validation-size", type=positive_int, default=500)
     city.add_argument("--variants", type=positive_int, default=4)
     city.set_defaults(function=prepare_cityscapes)
@@ -58,7 +60,9 @@ def main():
     acdc.add_argument("--output", default="data/acdc.jsonl")
     acdc.set_defaults(function=prepare_acdc)
     boxes = commands.add_parser("prepare-detection")
-    boxes.add_argument("--manifest", required=True)
+    detection_sources = boxes.add_mutually_exclusive_group(required=True)
+    detection_sources.add_argument("--manifest")
+    detection_sources.add_argument("--manifests", nargs="+")
     boxes.add_argument("--output", required=True)
     boxes.set_defaults(function=prepare_detection)
     memory = commands.add_parser("select-memory", help="Create a shared ordered herding plan")
@@ -66,7 +70,7 @@ def main():
     memory.add_argument("--config", default="configs/default.yaml")
     memory.add_argument("--data", default="data/weather")
     memory.add_argument("--reference", required=True)
-    memory.add_argument("--seed", type=int, default=17)
+    memory.add_argument("--seed", type=int, choices=[17], default=17, help="Common reference seed")
     memory.add_argument("--tasks", help="Comma-separated tasks to include in the shared plan")
     memory.add_argument("--max-pairs", type=positive_int, default=64)
     memory.set_defaults(function=select_memory)
@@ -117,11 +121,16 @@ def main():
     source.add_argument("--input")
     source.add_argument("--manifest")
     inference.add_argument("--policy", choices=["top1", "top2"])
+    inference.add_argument("--format", choices=["png", "npy", "both"], default="both")
     inference.set_defaults(function=infer)
     score = commands.add_parser("score-predictions")
     common(score)
     restoration_metrics(score)
-    for key in ["manifest", "predictions", "name"]:
+    scoring_manifests = score.add_mutually_exclusive_group(required=True)
+    scoring_manifests.add_argument("--manifest")
+    scoring_manifests.add_argument("--manifests", nargs="+")
+    score.add_argument("--seed", type=int)
+    for key in ["predictions", "name"]:
         score.add_argument(f"--{key}", required=True)
     score.set_defaults(function=score_predictions)
     segment = commands.add_parser("segmentation")
@@ -135,15 +144,24 @@ def main():
         "--segmenter-weights", default="nvidia/segformer-b2-finetuned-cityscapes-1024-1024"
     )
     segment.add_argument("--deeplab-source")
-    segment.add_argument("--short-side", type=positive_int, default=1024)
+    segment.add_argument(
+        "--short-side",
+        type=positive_int,
+        help="Optional resized evaluation; default is native resolution",
+    )
+    segment.add_argument("--precision", choices=["fp16", "fp32"], default="fp16")
+    segment.add_argument("--seed", type=int, help="Seed of externally generated predictions")
     segment.set_defaults(function=segmentation)
     detector = commands.add_parser("detection")
     common(detector)
-    detector.add_argument("--manifest", required=True)
+    detection_sources = detector.add_mutually_exclusive_group(required=True)
+    detection_sources.add_argument("--manifest")
+    detection_sources.add_argument("--manifests", nargs="+")
     detector.add_argument("--annotations", required=True)
     detector.add_argument("--detector-weights", required=True)
-    detector.add_argument("--score-threshold", type=float, default=0.05)
+    detector.add_argument("--score-threshold", type=float, default=0.001)
     detector.add_argument("--nms-threshold", type=float, default=0.5)
+    detector.add_argument("--seed", type=int, help="Seed of externally generated predictions")
     front = detector.add_mutually_exclusive_group(required=True)
     front.add_argument("--checkpoint")
     front.add_argument("--predictions")
@@ -152,6 +170,8 @@ def main():
     common(detector_training)
     detector_training.add_argument("--manifest", required=True)
     detector_training.add_argument("--annotations", required=True)
+    detector_training.add_argument("--validation-manifest", required=True)
+    detector_training.add_argument("--validation-annotations", required=True)
     detector_training.add_argument("--epochs", type=positive_int, default=12)
     detector_training.add_argument("--lr", type=float, default=0.005)
     detector_training.add_argument("--seed", type=int, default=17)
@@ -159,11 +179,15 @@ def main():
     timing = commands.add_parser("profile")
     common(timing)
     timing.add_argument("--checkpoint", required=True)
+    timing.add_argument("--manifest", default="data/weather/test_rain.jsonl")
     timing.add_argument("--height", type=positive_int, default=512)
     timing.add_argument("--width", type=positive_int, default=1024)
     timing.add_argument("--warmup", type=positive_int, default=100)
     timing.add_argument("--frames", type=positive_int, default=500)
-    timing.add_argument("--top-k", type=positive_int, default=2)
+    timing.add_argument("--repeats", type=positive_int, default=3)
+    timing.add_argument("--top-k", type=positive_int)
+    timing.add_argument("--telemetry", action="store_true")
+    timing.add_argument("--ambient-temperature", type=float)
     timing.add_argument("--precision", choices=["fp32", "fp16"], default="fp16")
     timing.add_argument(
         "--device-setup", default="", help="Power mode, clocks and other device settings"
@@ -173,6 +197,25 @@ def main():
     aggregate.add_argument("--evaluations", nargs="+", required=True)
     aggregate.add_argument("--output", required=True)
     aggregate.set_defaults(function=report)
+    comparison = commands.add_parser(
+        "compare", help="Compare restoration, perception, routing or device results"
+    )
+    comparison.add_argument(
+        "--kind",
+        choices=["restoration", "segmentation", "detection", "routing", "profile"],
+        required=True,
+    )
+    comparison.add_argument("--results", nargs="+", required=True)
+    comparison.add_argument("--names", nargs="+")
+    comparison.add_argument("--reference")
+    comparison.add_argument("--output", required=True)
+    comparison.set_defaults(function=compare)
+    comparison_plot = commands.add_parser("plot-comparison")
+    comparison_plot.add_argument("--comparison", required=True)
+    comparison_plot.add_argument("--metrics", nargs="+")
+    comparison_plot.add_argument("--restoration-comparison")
+    comparison_plot.add_argument("--output", required=True)
+    comparison_plot.set_defaults(function=plot_comparison)
     route_plot = commands.add_parser("plot-diagnostics")
     route_plot.add_argument("--diagnostics", required=True)
     route_plot.add_argument("--output", required=True)
@@ -198,6 +241,9 @@ def main():
     experiments.add_argument("--config", default="configs/default.yaml")
     experiments.add_argument("--data", default="data/weather")
     experiments.add_argument("--replay-plan")
+    experiments.add_argument(
+        "--order-replay-plans", nargs=3, help="Plans for default, fog-first and snow-first orders"
+    )
     experiments.add_argument("--seeds", nargs="+", type=int, default=[17, 29, 43])
     experiments.add_argument(
         "--dry-run", action="store_true", help="Print commands without training"
