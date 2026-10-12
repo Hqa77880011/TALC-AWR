@@ -62,8 +62,10 @@ def semantic_prediction(model, image, args, label_shape):
         device_type=image.device.type,
         enabled=image.device.type == "cuda" and args.precision == "fp16",
     ):
-        result = model(normalized)
-    logits = result.logits if args.segmenter == "segformer" else result
+        if args.segmenter == "segformer":
+            logits = model(normalized).logits
+        else:
+            logits = model.classifier(model.backbone(normalized))
     logits = logits.float()
     logits = F.interpolate(logits, size=normalized.shape[-2:], mode="bilinear", align_corners=False)
     logits = logits[..., :new_h, :new_w]
